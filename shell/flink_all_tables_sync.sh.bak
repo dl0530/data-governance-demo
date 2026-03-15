@@ -1,0 +1,192 @@
+#!/bin/bash
+# ====================== 配置区 ======================
+FLINK_HOME="/opt/bigdata/flink"
+HADOOP_HOME="/opt/bigdata/hadoop-3.3.6"
+LOG_DIR="/opt/donglin/data-governance-demo/logs"
+SQL_TEMPLATE="/opt/donglin/data-governance-demo/sql/flink/all_table_sync_template.sql"
+RUN_DATE=$(date +%F)
+
+# --- 【关键修复】设置 Hadoop 环境 ---
+export HADOOP_CONF_DIR="$HADOOP_HOME/etc/hadoop"
+# 动态获取 Hadoop 完整 classpath，解决 NoClassDefFoundError
+export HADOOP_CLASSPATH=$($HADOOP_HOME/bin/hadoop classpath)
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] 初始化环境...${NC}"
+echo "  -> Flink Home: $FLINK_HOME"
+echo "  -> Hadoop Conf: $HADOOP_CONF_DIR"
+
+# 检查关键配置文件
+if [ ! -f "$HADOOP_CONF_DIR/core-site.xml" ] || [ ! -f "$HADOOP_CONF_DIR/hdfs-site.xml" ]; then
+    echo -e "${RED}错误：找不到 core-site.xml 或 hdfs-site.xml${NC}"
+    echo "  请检查 HADOOP_HOME 设置是否正确 ($HADOOP_HOME)"
+    exit 1
+fi
+echo -e "${GREEN}  -> Hadoop 环境检查通过${NC}"
+
+# 全局业务配置
+KAFKA_TOPIC="canal_demo_oltp"
+KAFKA_SERVER="localhost:9092"
+HDFS_BASE="hdfs://localhost:9000/user/hive/warehouse/demo_ods.db"
+
+# 表配置格式：Key="ID", Value="MySQL表名|Hive表名|字段列表(逗号分隔)"
+declare -A TABLE_CONFIG
+TABLE_CONFIG["t1"]="u_user|ods_u_user|user_id,username,register_time,update_time"
+TABLE_CONFIG["t2"]="p_product|ods_p_product|product_id,product_name,price,create_time,update_time"
+TABLE_CONFIG["t3"]="o_order|ods_o_order|order_id,user_id,total_amount,order_status,create_time,update_time"
+TABLE_CONFIG["t4"]="o_order_detail|ods_o_order_detail|detail_id,order_id,product_id,quantity,create_time,update_time"
+
+# --- 辅助函数：自动推断类型 ---
+get_type() {
+    local f=$1
+    # 简单的启发式规则，可根据实际业务调整
+    if [[ "$f" == *"id"* || "$f" == *"status"* || "$f" == *"quantity"* ]]; then 
+        echo "INT"
+    elif [[ "$f" == *"price"* || "$f" == *"amount"* ]]; then 
+        echo "DECIMAL(10,2)"
+    else 
+        echo "STRING"
+    fi
+}
+
+# --- 核心函数：生成 SQL 文件 ---
+generate_sql_file() {
+    local mysql_tbl=$1
+    local hive_tbl=$2
+    local fields_str=$3
+    local output_file=$4
+    
+    local schema_defs=""
+    local select_exprs=""
+    local IFS=','
+    read -ra FIELDS <<< "$fields_str"
+    
+    local count=${#FIELDS[@]}
+    local idx=0
+    
+    for f in "${FIELDS[@]}"; do
+        f=$(echo $f | xargs) # 去除空格
+        local t=$(get_type "$f")
+        local logic=""
+        
+        if [ "$t" = "STRING" ]; then
+            logic="data[1]['${f}']"
+        else
+            logic="CAST(data[1]['${f}'] AS ${t})"
+        fi
+        
+        if [ $idx -gt 0 ]; then
+            schema_defs+=", "
+            select_exprs+=", "
+        fi
+        schema_defs+="${f} ${t}"
+        select_exprs+="${logic}"
+        ((idx++))
+    done
+
+    # 使用 sed 进行替换 (模板为单行，安全)
+    sed -e "s|__SCHEMA_FIELDS__|${schema_defs}|g" \
+        -e "s|__SELECT_LOGIC__|${select_exprs}|g" \
+        -e "s|__MYSQL_TABLE__|${mysql_tbl}|g" \
+        -e "s|__KAFKA_TOPIC__|${KAFKA_TOPIC}|g" \
+        -e "s|__KAFKA_SERVER__|${KAFKA_SERVER}|g" \
+        -e "s|__HDFS_PATH__|${HDFS_BASE}/${hive_tbl}|g" \
+        "$SQL_TEMPLATE" > "$output_file"
+}
+
+# ====================== 主流程 ======================
+echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] 开始 Flink 全表同步...${NC}"
+
+if [ ! -f "$SQL_TEMPLATE" ]; then
+    echo -e "${RED}错误：SQL 模板文件不存在 -> $SQL_TEMPLATE${NC}"
+    exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
+# 1. 清理旧任务
+echo "清理旧任务..."
+OLD_JOBS=$($FLINK_HOME/bin/flink list -r 2>/dev/null | grep -i "insert" | awk '{print $1}')
+if [ -n "$OLD_JOBS" ]; then
+    for j in $OLD_JOBS; do 
+        $FLINK_HOME/bin/flink cancel $j > /dev/null 2>&1
+        echo "  - 已取消：$j"
+    done
+else
+    echo "  - 无旧任务"
+fi
+
+# 2. 重启集群 (确保新的 Classpath 生效)
+echo "重启 Flink 集群以加载新环境..."
+$FLINK_HOME/bin/stop-cluster.sh > /dev/null 2>&1
+sleep 2
+$FLINK_HOME/bin/start-cluster.sh
+sleep 5 # 多等一会确保 TM 启动完成
+
+declare -A SUCCESS_MAP
+
+# 3. 循环处理每张表
+for key in "${!TABLE_CONFIG[@]}"; do
+    cfg=${TABLE_CONFIG[$key]}
+    m_tbl=$(echo $cfg | cut -d'|' -f1)
+    h_tbl=$(echo $cfg | cut -d'|' -f2)
+    flds=$(echo $cfg | cut -d'|' -f3)
+    
+    echo -e "${YELLOW}----------------------------------------${NC}"
+    echo -e "${YELLOW}处理表：$m_tbl -> $h_tbl${NC}"
+
+    # 【新增】提交前检查内存，如果可用内存小于 1G，警告并等待
+    avail_mem=$(free -m | awk '/^Mem:/{print $7}')
+    if [ "$avail_mem" -lt 1000 ]; then
+        echo -e "${RED}警告：可用内存仅剩 ${avail_mem}MB，等待 30 秒让 GC 回收...${NC}"
+        sleep 30
+    fi
+
+    nohup $FLINK_HOME/bin/sql-client.sh -f "$tmp_sql" > "$log_file" 2>&1 &
+    pid=$!
+
+    # 【修改】延长等待时间到 20 秒，给慢速磁盘和 JVM 预热时间
+    sleep 20
+    
+    tmp_sql="$LOG_DIR/tmp_${m_tbl}.sql"
+    log_file="$LOG_DIR/flink_${m_tbl}_${RUN_DATE}.log"
+    
+    generate_sql_file "$m_tbl" "$h_tbl" "$flds" "$tmp_sql"
+    
+    # 提交任务
+    nohup $FLINK_HOME/bin/sql-client.sh -f "$tmp_sql" > "$log_file" 2>&1 &
+    pid=$!
+    
+    sleep 8 # 给 Flink 多一点时间初始化 Hadoop 连接
+    
+    # 检查结果
+    if grep -qE "Exception|Error|ParseException|NoClassDefFoundError" "$log_file"; then
+        echo -e "${RED}启动失败！查看日志：$log_file${NC}"
+        echo -e "${RED}错误摘要:${NC}"
+        grep -A 3 "ERROR\|Exception" "$log_file" | head -n 6
+        # 如果失败，保留临时 SQL 方便调试
+        echo -e "${YELLOW}生成的 SQL 内容:${NC}"
+        cat "$tmp_sql"
+    else
+        job_id=$($FLINK_HOME/bin/flink list -r 2>/dev/null | grep -i "insert" | head -1 | awk '{print $1}')
+        if [ -n "$job_id" ]; then
+            echo -e "${GREEN}启动成功! JobID: $job_id${NC}"
+            SUCCESS_MAP[$m_tbl]="$job_id"
+        else
+            # 有时任务刚起还没注册到列表，只要日志没报错也算成功
+            echo -e "${GREEN}任务已提交 (PID: $pid)，日志无报错，视为成功${NC}"
+            SUCCESS_MAP[$m_tbl]="submitted"
+        fi
+    fi
+    
+    rm -f "$tmp_sql"
+done
+
+echo -e "${GREEN}==========================================${NC}"
+echo -e "${GREEN}同步完成。成功任务数：${#SUCCESS_MAP[@]}${NC}"
+echo -e "${GREEN}==========================================${NC}"
