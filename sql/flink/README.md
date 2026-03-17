@@ -41,4 +41,5 @@ sh /opt/donglin/data-governance-demo/shell/ods2dwd_cdc_sync.sh
 1. 执行前需确保：MySQL binlog开启（ROW模式）、Canal/Kafka/Flink/Hive网络互通；
 2. 01-04/11-14号文件需在Flink SQL Client执行，21-24/99号文件在Hive CLI执行；
 3. 21-24号文件中`${SYNC_DATE}`为日期占位符，手动执行需替换为实际日期；
-4. 若同步失败，优先检查Kafka主题、Canal配置、Flink-Hive Catalog连接。
+4. 若同步失败，优先检查Kafka主题、Canal配置、Flink-Hive Catalog连接；
+5. 当前DWD层存在 “时间窗口割裂” 和 “重复计算” 问题，Shell 跑，有延迟，会重复计算等，适合处理数据不大、对实时性要求不严格的场景。
